@@ -937,7 +937,7 @@ class TICKETER:
             # Extract short domain name (first part before dot)
             domain_parts = self.__domain.upper().split('.')
             if len(domain_parts) > 1:
-                # Use first part as short domain name (e.g., CORP.GOODS.RU -> CORP)
+                # Use first part as short domain name
                 kerbdata['LogonDomainName'] = domain_parts[0]
                 logging.info('Using short domain name: %s' % kerbdata['LogonDomainName'])
             else:
