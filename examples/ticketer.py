@@ -24,11 +24,12 @@
 #       baduser.ccache.
 #
 #       ./ticketer.py -nthash <krbtgt/service nthash> -aesKey <krbtgt/service AES> -domain-sid <your domain SID> -domain <your domain FQDN>
-#                     -request -user <a valid domain user> -password 'Password123' -ldap 'carline.lamar' baduser
+#                     -request -user <a valid domain user> -password <valid domain user's password> baduser
 #
 #       will first authenticate against the KDC (using -user/-password) and get a TGT that will be used
-#       as template for customization. It will then query LDAP for 'carline.lamar' information to populate
-#       the PAC. Ticket will be generated for 'baduser' and saved as baduser.ccache.
+#       as template for customization. Whatever encryption algorithms used on that ticket will be honored,
+#       hence you might need to specify both -nthash and -aesKey data. Ticket will be generated for 'baduser' and saved
+#       as baduser.ccache.
 #
 # Author:
 #   Alberto Solino (@agsolino)
